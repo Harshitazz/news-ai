@@ -8,5 +8,3 @@ sentence-transformers
 python-dotenv
 python-multipart
 unstructured
-celery
-redis
