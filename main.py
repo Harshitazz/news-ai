@@ -1,4 +1,4 @@
-from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi import FastAPI, BackgroundTasks, HTTPException,UploadFile
 from pydantic import BaseModel
 import os
 import pickle
@@ -13,7 +13,7 @@ from langchain.chains import RetrievalQAWithSourcesChain
 from dotenv import load_dotenv
 import uvicorn
 from fastapi import Request
-
+import fitz 
 from fastapi.middleware.cors import CORSMiddleware
 
 # Load environment variables
@@ -99,7 +99,9 @@ def get_task_status(task_id: str):
     return {"task_id": task_id, "status": status}
 
 @app.post("/ask")
-def ask(question: str):
+async def ask(request: Request):
+    data = await request.json()
+    question=data.get("question","")
     if not os.path.exists(file_path):
         raise HTTPException(status_code=500, detail="FAISS index not initialized. Please initialize first.")
 
@@ -115,6 +117,102 @@ def ask(question: str):
     
 
     return {"answer": result["answer"], "sources": result.get("sources", "")}
+
+embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+PDF_FAISS_PATH = "faiss_store_pdf.pkl"
+# ✅ **Function to Extract Text from PDF**
+def extract_text_from_pdf(pdf_path: str):
+    text = ""
+    doc = fitz.open(pdf_path)
+    for page in doc:
+        text += page.get_text("text") + "\n"
+    return text
+
+
+# ✅ **Background Task to Process PDFs & Initialize FAISS**
+async def process_pdf_faiss(task_id: str, pdf_files: list[str]):
+    try:
+        task_status[task_id] = "Processing"
+        all_docs = []
+
+        for pdf_path in pdf_files:
+            text = extract_text_from_pdf(pdf_path)
+            text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+            docs = text_splitter.split_text(text)
+            all_docs.extend(docs)
+
+        # Generate embeddings
+        vectorstore = FAISS.from_texts(all_docs, embedding_model)
+
+        # Save FAISS index
+        with open(PDF_FAISS_PATH, "wb") as f:
+            pickle.dump(vectorstore, f)
+
+        task_status[task_id] = "Completed"
+    except Exception as e:
+        task_status[task_id] = f"Failed: {str(e)}"
+
+
+# ✅ **API Endpoint to Upload PDFs**
+@app.post("/upload_pdfs/")
+async def upload_pdfs(background_tasks: BackgroundTasks, files: list[UploadFile]):
+    try:
+        pdf_paths = []
+
+        for file in files:
+            if not file.filename.endswith(".pdf"):
+                raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
+
+            pdf_path = f"uploads/{file.filename}"
+            os.makedirs("uploads", exist_ok=True)
+
+            with open(pdf_path, "wb") as f:
+                f.write(await file.read())
+
+            pdf_paths.append(pdf_path)
+
+        # Start FAISS processing in the background
+        task_id = str(uuid.uuid4())
+        task_status[task_id] = "Pending"
+        background_tasks.add_task(process_pdf_faiss, task_id, pdf_paths)
+
+        return {"message": "PDF processing started", "task_id": task_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+from pydantic import BaseModel
+
+class AskPDFRequest(BaseModel):
+    question: str
+
+# ✅ **Ask a Question Based on PDF Data**
+@app.post("/ask_pdf")
+async def ask_pdf(request: AskPDFRequest):
+    data = request.dict()
+    question = data.get("question", "")
+
+    if not os.path.exists(PDF_FAISS_PATH):
+        raise HTTPException(status_code=500, detail="FAISS index for PDFs not initialized. Upload PDFs first.")
+
+    with open(PDF_FAISS_PATH, "rb") as f:
+        vectorstore = pickle.load(f)
+
+    if not question:
+        raise HTTPException(status_code=400, detail="No question provided.")
+    
+    retrieved_docs = vectorstore.as_retriever().get_relevant_documents(question)
+    for doc in retrieved_docs:
+        if "source" not in doc.metadata:
+            doc.metadata["source"] = "unknown"
+
+    # Perform retrieval-based Q&A
+    chain = RetrievalQAWithSourcesChain.from_llm(llm=llm, retriever=vectorstore.as_retriever())
+    result = chain.invoke({"question": question})
+
+    return {"answer": result["answer"]}
+
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

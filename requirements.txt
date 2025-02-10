@@ -1,10 +1,12 @@
+
 fastapi
 uvicorn
-langchain_groq
-langchain-community
-langchain-huggingface
-faiss-cpu
-sentence-transformers
 python-dotenv
-python-multipart
+pydantic
+langchain
+langchain-community
+langchain-groq
+langchain-huggingface
 unstructured
+pymupdf==1.21.0  # fitz (PyMuPDF)
+faiss-cpu
