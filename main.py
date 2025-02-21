@@ -1,4 +1,4 @@
-from fastapi import FastAPI, BackgroundTasks, HTTPException,UploadFile
+from fastapi import FastAPI, BackgroundTasks, HTTPException,UploadFile,Depends
 from pydantic import BaseModel
 import os
 import pickle
@@ -15,13 +15,21 @@ import uvicorn
 from fastapi import Request
 import fitz 
 from fastapi.middleware.cors import CORSMiddleware
-
+from typing import Dict
+from auth import get_current_user
+from s3Upload import upload_file_to_s3, s3_client
+from cleanUp import lifespan
 # Load environment variables
 load_dotenv()
+
+CLERK_SECRET_KEY = os.getenv("CLERK_SECRET_KEY")
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+S3_BUCKET_NAME = os.getenv("AWS_S3_BUCKET_NAME")
 groq_api_key = os.getenv("GROQ_API_KEY")
 
 # Initialize FastAPI app
-app = FastAPI()
+app = FastAPI(lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # Allow all origins for debugging
@@ -129,56 +137,100 @@ def extract_text_from_pdf(pdf_path: str):
     return text
 
 
-# ✅ **Background Task to Process PDFs & Initialize FAISS**
-async def process_pdf_faiss(task_id: str, pdf_files: list[str]):
-    try:
-        task_status[task_id] = "Processing"
-        all_docs = []
 
-        for pdf_path in pdf_files:
-            text = extract_text_from_pdf(pdf_path)
-            text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
-            docs = text_splitter.split_text(text)
-            all_docs.extend(docs)
+def process_pdf_faiss(task_id: str, user_id: str):
+    """Downloads PDFs, generates FAISS index, and stores in S3"""
+    try:
+        pdf_prefix = f"pdf_uploads/{user_id}/{task_id}/"
+        response = s3_client.list_objects_v2(Bucket=S3_BUCKET_NAME, Prefix=pdf_prefix)
+
+        all_docs = []
+        if "Contents" not in response:
+            raise Exception("No PDFs found in S3 for processing.")
+
+        for obj in response.get("Contents", []):
+            pdf_key = obj["Key"]
+            local_pdf_path = f"/tmp/{os.path.basename(pdf_key)}"
+
+            print(f"Downloading: {pdf_key}")
+            os.makedirs("/tmp", exist_ok=True)
+            s3_client.download_file(S3_BUCKET_NAME, pdf_key, local_pdf_path)
+
+            # Extract text
+            text = ""
+            with fitz.open(local_pdf_path) as doc:
+                text = "\n".join([page.get_text("text") for page in doc])
+
+            if not text.strip():
+                print(f"Warning: No text extracted from {pdf_key}. Skipping.")
+                continue
+
+            print(f"Extracted {len(text)} characters from {pdf_key}")
+            all_docs.extend(RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100).split_text(text))
+
+        if not all_docs:
+            raise Exception("No valid text found in any PDFs. FAISS cannot be created.")
 
         # Generate embeddings
+        print("Generating FAISS index...")
         vectorstore = FAISS.from_texts(all_docs, embedding_model)
 
         # Save FAISS index
-        with open(PDF_FAISS_PATH, "wb") as f:
+        local_faiss_path = f"/tmp/{user_id}_faiss.pkl"
+        with open(local_faiss_path, "wb") as f:
             pickle.dump(vectorstore, f)
 
-        task_status[task_id] = "Completed"
+        # Upload FAISS index to S3
+        s3_faiss_key = f"{user_id}/faiss/faiss_store.pkl"
+        s3_client.upload_file(local_faiss_path, S3_BUCKET_NAME, s3_faiss_key)
+        os.remove(local_pdf_path)
+        print(f"FAISS index uploaded: {s3_faiss_key}")
+
     except Exception as e:
-        task_status[task_id] = f"Failed: {str(e)}"
+        print(f"Error in process_pdf_faiss: {str(e)}")
+
 
 
 # ✅ **API Endpoint to Upload PDFs**
 @app.post("/upload_pdfs/")
-async def upload_pdfs(background_tasks: BackgroundTasks, files: list[UploadFile]):
+async def upload_pdfs(background_tasks: BackgroundTasks, files: list[UploadFile], request_user: Dict[str, str] = Depends(get_current_user)):
     try:
+        user_id = request_user["user_id"]  # Get the user ID from Clerk
         pdf_paths = []
-
+        s3_urls = []
+        print(user_id)
+        task_id = str(uuid.uuid4())
         for file in files:
             if not file.filename.endswith(".pdf"):
                 raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
-
-            pdf_path = f"uploads/{file.filename}"
+            
+            
+            # Save locally
+            local_pdf_path = f"uploads/{user_id}_{file.filename}"
             os.makedirs("uploads", exist_ok=True)
-
-            with open(pdf_path, "wb") as f:
+            
+            with open(local_pdf_path, "wb") as f:
                 f.write(await file.read())
-
-            pdf_paths.append(pdf_path)
+            print("task0")
+            # Upload to S3
+            s3_pdf_key = f"pdf_uploads/{user_id}/{task_id}/{file.filename}"
+            s3_url = upload_file_to_s3(local_pdf_path, s3_pdf_key)
+            print("task1")
+            os.remove(local_pdf_path)
+            pdf_paths.append(local_pdf_path)
+            s3_urls.append(s3_url)
+            print("task2")
 
         # Start FAISS processing in the background
-        task_id = str(uuid.uuid4())
+        
         task_status[task_id] = "Pending"
-        background_tasks.add_task(process_pdf_faiss, task_id, pdf_paths)
+        background_tasks.add_task(process_pdf_faiss, task_id, user_id)
 
-        return {"message": "PDF processing started", "task_id": task_id}
+        return {"message": "PDF processing started", "task_id": task_id, "pdf_s3_urls": s3_urls}
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 
 from pydantic import BaseModel
@@ -188,15 +240,20 @@ class AskPDFRequest(BaseModel):
 
 # ✅ **Ask a Question Based on PDF Data**
 @app.post("/ask_pdf")
-async def ask_pdf(request: AskPDFRequest):
+async def ask_pdf(request: AskPDFRequest, request_user: Dict[str, str] = Depends(get_current_user)):
+    user_id = request_user["user_id"]
     data = request.dict()
     question = data.get("question", "")
 
-    if not os.path.exists(PDF_FAISS_PATH):
-        raise HTTPException(status_code=500, detail="FAISS index for PDFs not initialized. Upload PDFs first.")
-
-    with open(PDF_FAISS_PATH, "rb") as f:
-        vectorstore = pickle.load(f)
+    s3_faiss_key = f"{user_id}/faiss/faiss_store.pkl"
+    local_faiss_path = f"/tmp/{user_id}_faiss.pkl"
+    try:
+        s3_client.download_file(S3_BUCKET_NAME, s3_faiss_key, local_faiss_path)
+        with open(local_faiss_path, "rb") as f:
+            vectorstore = pickle.load(f)
+    except:
+        raise HTTPException(status_code=404, detail="FAISS index not found")
+    
 
     if not question:
         raise HTTPException(status_code=400, detail="No question provided.")

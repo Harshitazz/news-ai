@@ -10,3 +10,6 @@ langchain-huggingface
 unstructured
 pymupdf==1.21.0  # fitz (PyMuPDF)
 faiss-cpu
+python-multipart
+boto3
+fitz
